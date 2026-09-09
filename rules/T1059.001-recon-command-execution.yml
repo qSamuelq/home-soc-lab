@@ -1,0 +1,30 @@
+title: Encoded PowerShell Command Execution
+id: 3b0ffec6-0e2e-4842-9493-d2cd61c0a059
+status: experimental
+description: >
+  Detects execution of powershell.exe with the -EncodedCommand parameter or any
+  of its valid abbreviated forms. Commonly used to obfuscate command content
+  from command-line logging and naive string matching.
+references:
+  - https://attack.mitre.org/techniques/T1059/001/
+  - https://github.com/redcanaryco/atomic-red-team/blob/master/atomics/T1059.001/T1059.001.md
+author: Samuel Nwabunike
+date: 2026/09/09
+tags:
+  - attack.execution
+  - attack.t1059.001
+  - attack.defense_evasion
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection_img:
+    Image|endswith: '\powershell.exe'
+  selection_enc:
+    CommandLine|re: '(?i)\s-(e|en|enc|enco|encod|encode|encoded|encodedc|encodedco|encodedcom|encodedcomm|encodedcomma|encodedcomman|encodedcommand)\s'
+  condition: all of selection_*
+falsepositives:
+  - Software installers and MSI custom actions
+  - Configuration management tooling (SCCM, Intune, Ansible, Chocolatey)
+  - Vendor agents that wrap their own PowerShell calls
+level: medium

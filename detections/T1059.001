@@ -1,0 +1,246 @@
+# T1059.001 — Command and Scripting Interpreter: PowerShell
+
+| Field | Value |
+|---|---|
+| ATT&CK ID | T1059.001 |
+| Tactic | Execution (TA0002) |
+| Platform | Windows |
+| Host | `win-11-SIEM` (Windows 11, VirtualBox) |
+| Telemetry source | Sysmon Event ID 1 (Process Creation) → AMA → Log Analytics `Event` table |
+| SIEM | Microsoft Sentinel (`Home-soc-workspace`) |
+| Date tested | 2026-09-09 |
+
+---
+
+## 1. Attack simulation
+
+Atomic Red Team test **T1059.001-17 — "PowerShell Command Execution"**.
+
+```
+Invoke-AtomicTest T1059.001 -TestNumbers 17
+```
+
+Executor: `command_prompt`. The command is:
+
+```
+powershell.exe -e #{obfuscated_code}
+```
+
+The base64 payload decodes to an obfuscated `Invoke-Expression` that resolves to a
+`Write-Host 'Hello, from PowerShell!'` call. The technique being demonstrated is
+**obfuscated command execution via the `-EncodedCommand` parameter**, not the payload
+itself, which is deliberately harmless.
+
+**Why test 17 and not test 1:** test 1 executes Mimikatz and is correctly blocked by
+Microsoft Defender, so it produces no clean process-creation chain to detect against.
+Test 17 gives an unambiguous, safe execution artefact.
+
+---
+
+## 2. Telemetry validation
+
+Sysmon Event ID 1 events land in the classic **`Event`** table, not `WindowsEvent`,
+because the DCR was built using the Custom XPath collection method
+(`Microsoft-Windows-Sysmon/Operational!*`).
+
+All event detail is packed into the unlabelled `ParameterXml` column as a flat list of
+`<Param>` values, so fields have to be matched with `contains` / `matches regex` rather
+than referenced by name.
+
+Baseline query used to confirm the technique produced telemetry:
+
+```kql
+Event
+| where TimeGenerated > ago(1h)
+| where Source contains "Sysmon"
+| where EventCategory == 1
+| where ParameterXml contains "powershell.exe"
+| project TimeGenerated, Computer, ParameterXml
+| order by TimeGenerated desc
+```
+
+---
+
+## 3. Detection v1 — and why it was wrong
+
+The first rule written for this technique was:
+
+```kql
+Event
+| where Source contains "Sysmon"
+| where EventCategory == 1
+| where ParameterXml contains "whoami.exe" or ParameterXml contains "HOSTNAME.EXE"
+```
+
+It fired reliably on every test run, which initially looked like a working detection.
+
+**It was detecting the test harness, not the technique.**
+
+Evidence — process creation timestamps from a single `Invoke-AtomicTest` run:
+
+```
+12:07:30.827   HOSTNAME.EXE
+12:07:30.845   whoami.exe
+12:07:31.220   cmd.exe
+12:07:31.255   powershell.exe
+```
+
+`hostname` and `whoami` execute **before** `cmd.exe` and `powershell.exe`. They are
+emitted by `Invoke-AtomicTest` when it stamps its own execution log, not by the atomic
+test. This was confirmed three ways:
+
+1. The atomic YAML definition contains no reference to `whoami` or `hostname`.
+2. `Invoke-AtomicTest T1059.001 -TestNumbers 17 -ShowDetails` prints the full attack
+   command, which is only `powershell.exe -e <base64>`.
+3. Process-creation ordering in Sysmon places both binaries ahead of the payload.
+
+A real adversary running encoded PowerShell would not execute the harness, so this rule
+had **zero true detection coverage** for T1059.001 despite a 100% hit rate in testing.
+
+**Lesson recorded:** a detection that fires during simulation is not a validated
+detection. The rule must be traced back to a specific attacker-controlled artefact in
+the technique itself, not to an artefact of the tooling used to emulate it.
+
+---
+
+## 4. Detection v2 — current rule
+
+Rule name: **T1059.001 – Encoded PowerShell Command Execution**
+Severity: Medium · Run every 10 minutes · Lookback 10 minutes
+Entity mapping: Host → HostName → `Computer`
+
+```kql
+Event
+| where Source contains "Sysmon"
+| where EventCategory == 1
+| where ParameterXml contains "powershell.exe"
+| where ParameterXml matches regex @"(?i)\s-(e|en|enc|enco|encod|encode|encoded|encodedc|encodedco|encodedcom|encodedcomm|encodedcomma|encodedcomman|encodedcommand)\s"
+```
+
+**Why the regex rather than a string match on `-EncodedCommand`:** PowerShell resolves
+parameters by unambiguous prefix, so `-e`, `-en`, `-enc` and every intermediate form are
+all valid and all execute identically. Attackers routinely use the short forms
+specifically to evade naive string matching. The regex enumerates every valid prefix and
+is case-insensitive.
+
+Note also that the atomic command contains **two spaces** between `-e` and the payload,
+so any hardcoded single-space match would miss it. The `\s` boundaries handle this.
+
+---
+
+## 5. False positive analysis
+
+Encoded PowerShell is not inherently malicious. Observed and expected benign sources:
+
+- Software installers and MSI custom actions
+- Configuration management tooling (SCCM, Intune, Ansible, Chocolatey)
+- Scheduled tasks created by legitimate management software
+- Some vendor agents that wrap their own PowerShell calls
+
+This makes the rule **medium fidelity on its own**. It is a strong signal when combined
+with context, and noisy when used in isolation.
+
+Planned improvements (not yet implemented):
+
+- Decode the base64 payload at query time and alert on the decoded content, so benign
+  encoded commands can be allowlisted by what they actually do
+- Baseline parent process — `cmd.exe` or `winword.exe` spawning encoded PowerShell is far
+  more suspicious than `services.exe`
+- Allowlist known-good signing paths and management agent parent processes
+- Alert on encoded execution by non-administrative users specifically
+
+---
+
+## 6. Tuning — before and after
+
+**Method:** identical three-execution batch run twice, with one setting changed between
+runs and nothing else touched.
+
+```powershell
+Invoke-AtomicTest T1059.001 -TestNumbers 17
+Start-Sleep 20
+Invoke-AtomicTest T1059.001 -TestNumbers 17
+Start-Sleep 20
+Invoke-AtomicTest T1059.001 -TestNumbers 17
+```
+
+Counting query — `SecurityIncident` writes a new row on every incident state change, so
+`arg_max` is required to avoid massively overcounting:
+
+```kql
+SecurityIncident
+| where CreatedTime > ago(20m)
+| where Title contains "Encoded PowerShell"
+| summarize arg_max(TimeGenerated, *) by IncidentNumber
+| project IncidentNumber, CreatedTime
+```
+
+### Results
+
+| | Executions | Alerts | Incidents | Incident numbers |
+|---|---|---|---|---|
+| **Before tuning** | 3 | 6 | **7** | 1095–1101 |
+| **After tuning** | 3 | 1 | **1** | 1102 |
+
+**Reduction: 7 incidents → 1 incident for identical attacker activity. ~86% fewer items
+in the analyst queue, with no loss of detection coverage.**
+
+### Tuning applied
+
+Incident settings → **Alert grouping: Enabled**, limited to a 24 hour window, method
+*"Grouping all alerts triggered by this rule into a single incident"*.
+
+### Why 3 executions produced 6 alerts pre-tuning
+
+The detection matches on `ParameterXml`, and each execution generates **two** matching
+process-creation events: the `cmd.exe` process (whose command line contains
+`powershell.exe -e ...`) and the `powershell.exe` process itself. Two events × three
+executions = six matching events. With alert grouping off, each became its own alert and
+each alert opened its own incident.
+
+> **To verify before publishing:** the post-tuning run produced a single *alert*, not just
+> a single incident. Alert grouping operates at the incident layer only, so if event
+> grouping on the Set rule logic tab was also changed to *"Group all events into a single
+> alert"*, that accounts for the 6 → 1 alert drop and should be documented as a second,
+> separate tuning lever. Confirm which settings are live before finalising this section.
+
+---
+
+## 7. Analyst triage steps
+
+If this alert fires in production, work it in this order:
+
+1. **Decode the payload.** Extract the base64 from the command line and decode as
+   UTF-16LE (`[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($b64))`).
+   The decoded content determines everything downstream.
+2. **Identify the parent process.** Office applications, browsers, `wscript.exe` or
+   `mshta.exe` spawning encoded PowerShell indicate likely initial access. `services.exe`
+   or a known management agent suggests legitimate tooling.
+3. **Identify the user.** Service accounts running encoded commands on a schedule are
+   usually expected. Interactive standard users are not.
+4. **Check for follow-on activity.** Pivot on the host and a ±10 minute window for
+   outbound network connections (Sysmon EID 3), new scheduled tasks, registry Run key
+   writes, or credential access attempts.
+5. **Assess prevalence.** A command line seen once on one host is more suspicious than
+   the same one seen on two hundred hosts, which usually means enterprise software.
+6. **Escalate or close.** Escalate on decoded content containing download cradles,
+   `FromBase64String`, `IEX`, or reflective loading. Close as benign with the decoded
+   command recorded in the ticket, and add an allowlist entry if it will recur.
+
+---
+
+## 8. Cleanup
+
+```powershell
+Invoke-AtomicTest T1059.001 -TestNumbers 17 -Cleanup
+```
+
+---
+
+## 9. Artefacts
+
+- `rules/T1059.001_encoded_powershell.yml` — Sigma rule
+- `screenshots/T1059.001-atomic-showdetails.png` — attack command definition
+- `screenshots/T1059.001-telemetry.png` — Sysmon events in the `Event` table
+- `screenshots/T1059.001-incidents-before.png` — 7 incidents, grouping off
+- `screenshots/T1059.001-incidents-after.png` — 1 incident, grouping on
