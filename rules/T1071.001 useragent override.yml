@@ -1,0 +1,36 @@
+title: Command-Line HTTP Client with User Agent Override
+id: bea3e24b-e470-451b-8f4a-d601835e2cb4
+status: experimental
+description: >
+  Detects curl, wget or certutil making an HTTP request with an explicitly overridden
+  user agent string. Malware beaconing to command and control infrastructure commonly
+  sets a custom user agent, either to impersonate a browser or because the implant's
+  HTTP library carries a hardcoded default. Manual use of a user agent override on an
+  endpoint is rare. Note this detects the command-line form only - an implant issuing
+  the same request from within its own process carries the user agent in the HTTP layer,
+  which endpoint process telemetry does not observe.
+references:
+  - https://attack.mitre.org/techniques/T1071/001/
+  - https://github.com/redcanaryco/atomic-red-team/blob/master/atomics/T1071.001/T1071.001.md
+author: Samuel Nwabunike
+date: 2026/09/12
+tags:
+  - attack.command_and_control
+  - attack.t1071.001
+logsource:
+  product: windows
+  category: process_creation
+detection:
+  selection_img:
+    Image|endswith:
+      - '\curl.exe'
+      - '\wget.exe'
+      - '\certutil.exe'
+  selection_ua:
+    CommandLine|re: '(?i)\s-A\s+"[^"]+"'
+  condition: all of selection_*
+falsepositives:
+  - Developers and administrators manually testing web endpoints
+  - CI and build scripts identifying themselves to APIs
+  - Monitoring and health-check scripts
+level: medium
