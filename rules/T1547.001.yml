@@ -1,0 +1,43 @@
+title: Run Key Persistence Written by Script Interpreter
+id: 345ef3f2-910e-46e2-b497-7ef2deaa3cbe
+status: experimental
+description: >
+  Detects a value being written to a Windows autostart Run key where the writing
+  process is a script interpreter or command-line registry tool rather than an
+  application's own binary. Legitimate installers and updaters set autostart entries
+  through the Windows API from their own signed executables; shelling out to reg.exe
+  or PowerShell to establish persistence is characteristic of attacker tradecraft.
+  Note this rule intentionally trades coverage for precision - persistence written
+  directly via the Windows API will not match, and other autostart locations such as
+  Winlogon\Shell require separate coverage.
+references:
+  - https://attack.mitre.org/techniques/T1547/001/
+  - https://github.com/redcanaryco/atomic-red-team/blob/master/atomics/T1547.001/T1547.001.md
+author: Samuel Nwabunike
+date: 2026/09/12
+tags:
+  - attack.persistence
+  - attack.privilege_escalation
+  - attack.t1547.001
+logsource:
+  product: windows
+  category: registry_set
+detection:
+  selection_key:
+    TargetObject|contains:
+      - '\CurrentVersion\Run\'
+      - '\CurrentVersion\RunOnce\'
+  selection_image:
+    Image|endswith:
+      - '\reg.exe'
+      - '\powershell.exe'
+      - '\pwsh.exe'
+      - '\cmd.exe'
+      - '\wscript.exe'
+      - '\cscript.exe'
+      - '\mshta.exe'
+  condition: all of selection_*
+falsepositives:
+  - Administrator scripts configuring autostart entries via reg.exe
+  - Deployment tooling that shells out to reg.exe during provisioning
+level: medium
